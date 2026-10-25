@@ -1,0 +1,8 @@
+{
+  "name": "Last Played",
+  "description": "See when you last listened to each song. Tracks listening locally and imports Spotify Extended Streaming History.",
+  "preview": "preview.png",
+  "main": "last-played.js",
+  "readme": "README.md",
+  "tags": ["history", "last-played", "playlists"]
+}
