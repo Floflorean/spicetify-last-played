@@ -1,7 +1,7 @@
 /* Last Played for Spicetify — standalone, local-only, no external dependencies.
  * Install: spicetify config extensions last-played.js && spicetify apply
  * Profile menu > Last Played: import Spotify Extended Streaming History JSON/ZIP.
- * Records >=30 seconds of observed playback; never treats seeking as listening.
+ * Records a configurable duration of observed playback; never treats seeking as listening.
  * Data lives in an account-specific IndexedDB database. Export backups before
  * clearing Spotify's application data. No playlists or ratings are modified.
  */
@@ -16,7 +16,7 @@
     const isTrack = uri => typeof uri === "string" && TRACK.test(uri);
 
     class ListenTracker {
-        constructor() { this.reset(); }
+        constructor(threshold = THRESHOLD) { this.threshold = threshold; this.reset(); }
         reset() { this.previous = null; this.heard = 0; this.qualified = false; this.savedAt = 0; this.lastHeardAt = 0; }
         finish() {
             if (!this.previous || !this.qualified || this.lastHeardAt <= this.savedAt) return null;
@@ -44,7 +44,7 @@
                 advanced > 0 && advanced <= elapsed + 1500) {
                 this.heard += Math.min(advanced, elapsed);
                 this.lastHeardAt = current.now;
-                if (this.heard >= THRESHOLD) {
+                if (this.heard >= this.threshold) {
                     this.qualified = true;
                     if (!this.savedAt || current.now - this.savedAt >= 15000) {
                         writes.push({ uri:current.uri, at:current.now });
@@ -69,7 +69,7 @@
         return Date.parse(utc);
     }
 
-    async function parseHistory(text, now = Date.now(), yieldTask = async () => {}) {
+    async function parseHistory(text, now = Date.now(), yieldTask = async () => {}, threshold = THRESHOLD) {
         const data = JSON.parse(text.replace(/^\uFEFF/, ""));
         const backup = data?.format === FORMAT;
         if (backup && data.version !== 1) throw new Error("Unsupported Last Played backup version.");
@@ -82,7 +82,7 @@
             if (!row || typeof row !== "object") { stats.invalid++; continue; }
             const uri = backup ? row.uri : row.spotify_track_uri;
             if (!isTrack(uri)) { stats.noTrack++; continue; }
-            if (!backup && (!Number.isFinite(row.ms_played) || row.ms_played < THRESHOLD)) { stats.short++; continue; }
+            if (!backup && (!Number.isFinite(row.ms_played) || row.ms_played < threshold)) { stats.short++; continue; }
             const at = parseTime(backup ? row.at : row.ts);
             if (!Number.isFinite(at) || at < 0 || at > now + 300000) { stats.invalid++; continue; }
             stats.qualifying++;
@@ -263,7 +263,9 @@
         const cache = new Map((await allRecords(db)).filter(r => isTrack(r.uri) && Number.isFinite(r.at)).map(r => [r.uri, r.at]));
         const rows = new WeakMap();
         const trackedHosts = new Set();
-        const tracker = new ListenTracker();
+        const readThreshold = Number(S.Platform.LocalStorageAPI?.getItem("lastPlayed:thresholdSeconds"));
+        let threshold = Number.isFinite(readThreshold) && readThreshold >= 1 && readThreshold <= 240 ? Math.round(readThreshold) * 1000 : THRESHOLD;
+        const tracker = new ListenTracker(threshold);
         const dirty = new Map();
         const disposers = [];
         let frame = 0, alive = true, importBusy = false, flushPromise = null, main = null, observer = null, saveError = "";
@@ -354,7 +356,12 @@
                     cell.className = "lp-column sr-column";
                     cell.setAttribute("role", ownHeader ? "columnheader" : "gridcell");
                     state = { cell, header:!!ownHeader, date:cells[header.date], uri, indices:new Map(), position:host.style.position, offset:0 };
-                    if (ownHeader) { cell.textContent = "Last played"; cell.title = "Last recorded listen of at least 30 seconds. Import older history from profile menu > Last Played."; }
+                    if (ownHeader) { cell.textContent = "Last played"; cell.title = "Click to open the full playlist sorted by last played.";
+                        const button = document.createElement("button");
+                        button.type = "button"; button.className = "lp-sort-header";
+                        button.textContent = "Last played ↕";
+                        button.onclick = event => { event.stopPropagation(); void sortedPlaylist(); };
+                        cell.replaceChildren(button); }
                     rows.set(host, state); trackedHosts.add(host);
                     host.setAttribute("data-lp-grid", "");
                     if (getComputedStyle(host).position === "static") host.style.position = "relative";
@@ -418,7 +425,7 @@
         }
         function downloadBackup() {
             const tracks = [...cache].map(([uri, at]) => ({ uri, at }));
-            const blob = new Blob([JSON.stringify({ format:FORMAT, version:1, exportedAt:new Date().toISOString(), thresholdMs:THRESHOLD, tracks })], { type:"application/json" });
+            const blob = new Blob([JSON.stringify({ format:FORMAT, version:1, exportedAt:new Date().toISOString(), thresholdMs:threshold, tracks })], { type:"application/json" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a"); a.href = url; a.download = "last-played-backup.json"; a.click();
             setTimeout(() => URL.revokeObjectURL(url), 30000);
@@ -444,12 +451,13 @@
         async function importFiles(files, status) {
             if (importBusy) return;
             importBusy = true;
+            const importThreshold = threshold;
             let changed = 0, qualifying = 0, jsonFiles = 0, noTrack = 0, short = 0, invalid = 0;
             const errors = [];
             async function consume(text, name) {
                 status.textContent = "Reading " + name + "…"; await sleep(0);
                 try {
-                    const parsed = await parseHistory(text, Date.now(), () => sleep(0));
+                    const parsed = await parseHistory(text, Date.now(), () => sleep(0), importThreshold);
                     changed += await mergeHistory(parsed);
                     qualifying += parsed.stats.qualifying; noTrack += parsed.stats.noTrack;
                     short += parsed.stats.short; invalid += parsed.stats.invalid; jsonFiles++;
@@ -479,10 +487,75 @@
             } catch (error) { status.textContent = `Saved ${changed} updates before stopping: ${error.message}`; }
             finally { importBusy = false; }
         }
+        async function sortedPlaylist() {
+            const path = S.Platform.History.location?.pathname || "";
+            const id = path.match(/^\/playlist\/([A-Za-z0-9]+)/)?.[1];
+            if (!id) { notify("Sorted view currently supports playlists. Open a playlist first."); return; }
+            const uri = "spotify:playlist:" + id;
+            const root = document.createElement("div"); root.className = "lp-settings";
+            const status = document.createElement("p"); status.textContent = "Loading the full playlist…";
+            const direction = document.createElement("select"); direction.setAttribute("aria-label", "Last played sort order");
+            for (const [value, name] of [["newest", "Newest first"], ["oldest", "Oldest first"]]) {
+                const option = document.createElement("option"); option.value = value; option.textContent = name; direction.append(option);
+            }
+            const list = document.createElement("div"); list.className = "lp-sorted-list";
+            const more = document.createElement("button"); more.textContent = "Show more"; more.hidden = true;
+            root.append(status, direction, list, more);
+            S.PopupModal.display({ title:"Playlist sorted by Last Played", content:root, isLarge:true });
+            const items = []; let ordered = [], shown = 0;
+            function draw(reset = false) {
+                if (reset) { list.replaceChildren(); shown = 0; }
+                const end = Math.min(shown + 100, ordered.length);
+                for (; shown < end; shown++) {
+                    const item = ordered[shown]; const track = item.track || item;
+                    const trackUri = track.uri || item.uri;
+                    const row = document.createElement("div"); row.className = "lp-sorted-row";
+                    const play = document.createElement("button"); play.textContent = track.name || track.title || trackUri || "Unavailable track";
+                    play.disabled = !isTrack(trackUri);
+                    play.onclick = async () => {
+                        try { ensureAccount(); await S.Player.playUri(trackUri); }
+                        catch (error) { notify("Could not play track: " + error.message); }
+                    };
+                    const artist = document.createElement("span");
+                    artist.textContent = (track.artists || []).map(a => a.name).filter(Boolean).join(", ");
+                    const date = document.createElement("span"); const at = cache.get(trackUri);
+                    date.textContent = at ? format === "date" ? new Date(at).toLocaleDateString() : relativeTime(at) : "Not recorded yet";
+                    date.title = at ? exact(at) : "No qualifying listen recorded";
+                    row.append(play, artist, date); list.append(row);
+                }
+                more.hidden = shown >= ordered.length;
+            }
+            function sort() {
+                ordered = items.map((item, index) => ({ item, index })).sort((a, b) => {
+                    const x = cache.get((a.item.track || a.item).uri) || 0;
+                    const y = cache.get((b.item.track || b.item).uri) || 0;
+                    if (!x || !y) return x ? -1 : y ? 1 : a.index - b.index;
+                    return (direction.value === "newest" ? y - x : x - y) || a.index - b.index;
+                }).map(x => x.item);
+                draw(true);
+            }
+            more.onclick = () => draw(); direction.onchange = sort;
+            try {
+                let offset = 0;
+                while (true) {
+                    ensureAccount();
+                    const page = await S.Platform.PlaylistAPI.getContents(uri, { offset, limit:100 });
+                    if (!Array.isArray(page?.items)) throw new Error("Spotify returned an unsupported playlist response.");
+                    items.push(...page.items); offset += page.items.length;
+                    const total = Number(page.totalLength ?? page.total);
+                    status.textContent = `Loaded ${offset} tracks…`;
+                    if ((Number.isFinite(total) && offset >= total) || (!Number.isFinite(total) && page.items.length < 100)) break;
+                    if (!page.items.length) throw new Error("Spotify returned an incomplete playlist. Try again.");
+                    await sleep(0);
+                }
+                ensureAccount(); sort();
+                status.textContent = `${items.length} tracks. Unrecorded tracks appear last in both directions. This view does not change the saved playlist order. Click a song to play it individually.`;
+            } catch (error) { status.textContent = "Could not load the full playlist: " + error.message; list.replaceChildren(); more.hidden = true; }
+        }
         function settings() {
             const root = document.createElement("div"); root.className = "lp-settings";
             const intro = document.createElement("p");
-            intro.textContent = "Records songs after 30 seconds of observed listening. Seeking and paused time do not count. Recording works while this Spotify client is open; phone-only plays need a later history import. Only exact track IDs are matched.";
+            intro.textContent = "Records songs after the selected duration of observed listening. Seeking and paused time do not count. Recording works while this Spotify client is open; phone-only plays need a later history import. Only exact track IDs are matched.";
             const privacy = document.createElement("p"); privacy.textContent = "History is stored locally for this Spotify account. It is not uploaded or synced. Export a backup before clearing Spotify data or moving to another computer.";
             const count = document.createElement("p"); count.textContent = `${cache.size.toLocaleString()} tracks recorded.` + (saveError ? " Unsaved changes: " + saveError : "");
             const label = document.createElement("label"); label.textContent = "Column display: ";
@@ -507,7 +580,23 @@
             };
             const exportButton = document.createElement("button"); exportButton.textContent = "Export Last Played backup";
             exportButton.onclick = downloadBackup;
-            root.append(intro, privacy, count, label, heading, steps, link, picker, status, exportButton);
+            const thresholdLabel = document.createElement("label");
+            thresholdLabel.className = "lp-threshold";
+            const slider = document.createElement("input"); slider.type = "range";
+            slider.min = "1"; slider.max = "240"; slider.step = "1"; slider.value = String(threshold / 1000);
+            slider.setAttribute("aria-label", "Seconds required to count as listened");
+            const value = document.createElement("span");
+            const updateValue = () => { value.textContent = `Count as listened after ${slider.value} seconds`; };
+            updateValue(); slider.oninput = updateValue;
+            slider.onchange = () => {
+                tick(); const last = tracker.finish(); if (last) record(last);
+                threshold = Number(slider.value) * 1000; tracker.threshold = threshold;
+                tracker.reset(); // Apply prospectively, never retroactively qualify the current sample.
+                S.Platform.LocalStorageAPI?.setItem("lastPlayed:thresholdSeconds", String(slider.value)); tick();
+            };
+            thresholdLabel.append(value, slider);
+            const note = document.createElement("p"); note.textContent = "1–240 seconds. Changes start a fresh listening timer and apply to future listening and new Spotify history imports. Existing timestamps and backup imports are preserved. Increasing this value cannot undo older records.";
+            root.append(intro, thresholdLabel, note, privacy, count, label, heading, steps, link, picker, status, exportButton);
             S.PopupModal.display({ title:"Last Played", content:root, isLarge:true });
         }
         const style = document.createElement("style"); style.id = "last-played-style";
@@ -515,6 +604,14 @@
           [data-lp-grid] { display:grid!important;grid-template-columns:var(--lp-columns)!important;column-gap:16px!important;padding-inline:16px!important;box-sizing:border-box!important; }
           .lp-column { display:flex!important;align-items:center;justify-content:center!important;min-width:0;white-space:nowrap;color:var(--text-subdued,#b3b3b3);font-size:13px; }
           .lp-column[role="columnheader"] { font-size:14px; }
+          .lp-sort-header { background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:8px 0; }
+          .lp-sort-header:hover { color:var(--text-base,#fff); }
+          .lp-threshold { display:block;margin:16px 0; }
+          .lp-threshold input { display:block;width:100%;margin-top:12px; }
+          .lp-sorted-list { max-height:55vh;overflow:auto;margin:16px 0; }
+          .lp-sorted-row { display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) 140px;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #4445; }
+          .lp-sorted-row span { overflow:hidden;text-overflow:ellipsis; }
+          .lp-sorted-row button { border:0!important;text-align:left;border-radius:4px!important; }
           .lp-settings p { margin:0 0 16px;line-height:1.5; }
           .lp-settings h3 { margin:24px 0 12px; }
           .lp-settings input[type=file] { display:block;margin:16px 0;max-width:100%; }
