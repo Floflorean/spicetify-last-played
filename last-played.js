@@ -191,9 +191,45 @@
         return `${amount} ${unit}${amount === 1 ? "" : "s"} ago`;
     }
 
+    function sortByLastPlayed(items, timestamps, direction) {
+        return items.map((item, index) => ({ item, index })).sort((a, b) => {
+            const uri = item => item.track?.uri || item.uri || item.link;
+            const x = timestamps.get(uri(a.item)) || 0, y = timestamps.get(uri(b.item)) || 0;
+            if (!x || !y) return x ? -1 : y ? 1 : a.index - b.index;
+            return (direction === "newest" ? y - x : x - y) || a.index - b.index;
+        }).map(entry => entry.item);
+    }
+
+    async function readFullPlaylist(readPage, ensureCurrent = () => {}) {
+        const items = []; let template = null, total = null;
+        for (let offset = 0; ; ) {
+            ensureCurrent();
+            const page = await readPage(offset, 200);
+            ensureCurrent();
+            if (!Array.isArray(page?.items)) throw new Error("Unsupported Spotify playlist response.");
+            if (!template) template = page;
+            const length = page.totalLength ?? page.total;
+            if (length !== undefined && Number.isFinite(Number(length))) {
+                if (total !== null && total !== Number(length)) throw new Error("Playlist changed while loading. Click Last played to try again.");
+                total = Number(length);
+            }
+            if (total !== null && total < 0) throw new Error("Invalid playlist length.");
+            if (total !== null && items.length + page.items.length > total) throw new Error("Inconsistent Spotify playlist pagination.");
+            items.push(...page.items); offset += page.items.length;
+            if (total !== null && offset === total) break;
+            if (!page.items.length) {
+                if (total !== null && offset < total) throw new Error("Spotify returned an incomplete playlist.");
+                break;
+            }
+            if (total === null && page.items.length < 200) break;
+            if (offset > 100000) throw new Error("Spotify did not finish paging this playlist.");
+        }
+        return { template, items };
+    }
+
     // The same file can be tested with Node without starting Spotify-specific code.
     if (typeof module !== "undefined" && module.exports) {
-        module.exports = { ListenTracker, parseHistory, zipDirectory, unzipEntry, relativeTime, crc32, THRESHOLD };
+        module.exports = { ListenTracker, parseHistory, zipDirectory, unzipEntry, relativeTime, crc32, THRESHOLD, sortByLastPlayed, readFullPlaylist };
         return;
     }
 
@@ -318,6 +354,7 @@
         function render() {
             if (!alive || String(accountName()) !== account) return;
             const path = S.Platform.History.location?.pathname || "";
+            if (nativeSort && routePlaylist() !== nativeSort.uri) clearNativeSort();
             if (!/^\/(playlist\/|collection\/tracks)/.test(path)) {
                 for (const host of trackedHosts) disposeRow(host);
                 return;
@@ -356,16 +393,24 @@
                     cell.className = "lp-column sr-column";
                     cell.setAttribute("role", ownHeader ? "columnheader" : "gridcell");
                     state = { cell, header:!!ownHeader, date:cells[header.date], uri, indices:new Map(), position:host.style.position, offset:0 };
-                    if (ownHeader) { cell.textContent = "Last played"; cell.title = "Click to open the full playlist sorted by last played.";
+                    if (ownHeader) { cell.textContent = "Last played"; cell.title = "Click to sort this playlist: newest first, oldest first, then normal Spotify sorting.";
                         const button = document.createElement("button");
                         button.type = "button"; button.className = "lp-sort-header";
                         button.textContent = "Last played ↕";
-                        button.onclick = event => { event.stopPropagation(); void sortedPlaylist(); };
+                        button.onclick = event => { event.stopPropagation(); void sortInPlaylist(host); };
                         cell.replaceChildren(button); }
                     rows.set(host, state); trackedHosts.add(host);
                     host.setAttribute("data-lp-grid", "");
                     if (getComputedStyle(host).position === "static") host.style.position = "relative";
                     layoutChanged = true;
+                }
+                if (ownHeader) {
+                    const active = nativeSort && nativeSort.uri === routePlaylist();
+                    const button = state.cell.querySelector("button");
+                    const text = "Last played" + (active ? nativeSortBusy ? " …" : nativeSort.direction === "newest" ? " ↓" : " ↑" : " ↕");
+                    if (button && button.textContent !== text) button.textContent = text;
+                    if (button) button.disabled = nativeSortBusy;
+                    state.cell.setAttribute("aria-sort", active ? nativeSort.direction === "newest" ? "descending" : "ascending" : "none");
                 }
                 state.uri = uri;
                 const before = cells[header.date + 1];
@@ -487,71 +532,141 @@
             } catch (error) { status.textContent = `Saved ${changed} updates before stopping: ${error.message}`; }
             finally { importBusy = false; }
         }
-        async function sortedPlaylist() {
-            const path = S.Platform.History.location?.pathname || "";
-            const id = path.match(/^\/playlist\/([A-Za-z0-9]+)/)?.[1];
-            if (!id) { notify("Sorted view currently supports playlists. Open a playlist first."); return; }
-            const uri = "spotify:playlist:" + id;
-            const root = document.createElement("div"); root.className = "lp-settings";
-            const status = document.createElement("p"); status.textContent = "Loading the full playlist…";
-            const direction = document.createElement("select"); direction.setAttribute("aria-label", "Last played sort order");
-            for (const [value, name] of [["newest", "Newest first"], ["oldest", "Oldest first"]]) {
-                const option = document.createElement("option"); option.value = value; option.textContent = name; direction.append(option);
-            }
-            const list = document.createElement("div"); list.className = "lp-sorted-list";
-            const more = document.createElement("button"); more.textContent = "Show more"; more.hidden = true;
-            root.append(status, direction, list, more);
-            S.PopupModal.display({ title:"Playlist sorted by Last Played", content:root, isLarge:true });
-            const items = []; let ordered = [], shown = 0;
-            function draw(reset = false) {
-                if (reset) { list.replaceChildren(); shown = 0; }
-                const end = Math.min(shown + 100, ordered.length);
-                for (; shown < end; shown++) {
-                    const item = ordered[shown]; const track = item.track || item;
-                    const trackUri = track.uri || item.uri;
-                    const row = document.createElement("div"); row.className = "lp-sorted-row";
-                    const play = document.createElement("button"); play.textContent = track.name || track.title || trackUri || "Unavailable track";
-                    play.disabled = !isTrack(trackUri);
-                    play.onclick = async () => {
-                        try { ensureAccount(); await S.Player.playUri(trackUri); }
-                        catch (error) { notify("Could not play track: " + error.message); }
-                    };
-                    const artist = document.createElement("span");
-                    artist.textContent = (track.artists || []).map(a => a.name).filter(Boolean).join(", ");
-                    const date = document.createElement("span"); const at = cache.get(trackUri);
-                    date.textContent = at ? format === "date" ? new Date(at).toLocaleDateString() : relativeTime(at) : "Not recorded yet";
-                    date.title = at ? exact(at) : "No qualifying listen recorded";
-                    row.append(play, artist, date); list.append(row);
-                }
-                more.hidden = shown >= ordered.length;
-            }
-            function sort() {
-                ordered = items.map((item, index) => ({ item, index })).sort((a, b) => {
-                    const x = cache.get((a.item.track || a.item).uri) || 0;
-                    const y = cache.get((b.item.track || b.item).uri) || 0;
-                    if (!x || !y) return x ? -1 : y ? 1 : a.index - b.index;
-                    return (direction.value === "newest" ? y - x : x - y) || a.index - b.index;
-                }).map(x => x.item);
-                draw(true);
-            }
-            more.onclick = () => draw(); direction.onchange = sort;
-            try {
-                let offset = 0;
-                while (true) {
-                    ensureAccount();
-                    const page = await S.Platform.PlaylistAPI.getContents(uri, { offset, limit:100 });
-                    if (!Array.isArray(page?.items)) throw new Error("Spotify returned an unsupported playlist response.");
-                    items.push(...page.items); offset += page.items.length;
-                    const total = Number(page.totalLength ?? page.total);
-                    status.textContent = `Loaded ${offset} tracks…`;
-                    if ((Number.isFinite(total) && offset >= total) || (!Number.isFinite(total) && page.items.length < 100)) break;
-                    if (!page.items.length) throw new Error("Spotify returned an incomplete playlist. Try again.");
-                    await sleep(0);
-                }
-                ensureAccount(); sort();
-                status.textContent = `${items.length} tracks. Unrecorded tracks appear last in both directions. This view does not change the saved playlist order. Click a song to play it individually.`;
-            } catch (error) { status.textContent = "Could not load the full playlist: " + error.message; list.replaceChildren(); more.hidden = true; }
+        // Native sorting adapter: supply the full sorted order to Spotify's own
+        // virtualized tracklist. No playlist write or queue mutations are used.
+        let nativeSort = null, nativeSortBusy = false, nativeSortSerial = 0;
+        const playlistAPI = S.Platform.PlaylistAPI;
+        const originalReads = new Map();
+        const proxyHeaders = new Set();
+        const routePlaylist = () => {
+            const id = (S.Platform.History.location?.pathname || "").match(/^\/playlist\/([A-Za-z0-9]+)/)?.[1];
+            return id ? "spotify:playlist:" + id : null;
+        };
+        function clearNativeSort() {
+            nativeSort = null; nativeSortBusy = false;
+            for (const header of proxyHeaders) header.removeAttribute("data-lp-proxy-sort");
+            proxyHeaders.clear(); schedule();
         }
+        function currentSort(state) {
+            ensureAccount();
+            if (nativeSort !== state || routePlaylist() !== state.uri) throw new Error("Last Played sort cancelled.");
+        }
+        function sortedContents(state, options) {
+            // Preserve native search/filter options, but fetch from the start
+            // and sort the entire matching result before taking a page.
+            const baseOptions = { ...options, offset:undefined, limit:undefined, sort:undefined };
+            const key = JSON.stringify(baseOptions);
+            state.promises ||= new Map();
+            if (!state.promises.has(key)) state.promises.set(key, (async () => {
+                const result = await readFullPlaylist((offset, limit) => originalReads.get("getContents").call(playlistAPI,
+                    state.uri, { ...baseOptions, offset, limit }), () => currentSort(state));
+                return { ...result, items:sortByLastPlayed(result.items, state.timestamps, state.direction) };
+            })());
+            return state.promises.get(key);
+        }
+        function pageOfSorted(result, options, fallback) {
+            const offset = Math.max(0, Number(options?.offset) || 0);
+            const requested = Number(options?.limit ?? fallback?.limit ?? 100);
+            const limit = Number.isFinite(requested) && requested > 0 ? requested : 100;
+            const items = result.items.slice(offset, offset + limit);
+            return { ...result.template, ...fallback, items, offset, limit:items.length, totalLength:result.items.length };
+        }
+        function installNativeSort() {
+            if (!playlistAPI || typeof playlistAPI.getContents !== "function") return false;
+            const wrappers = new Map();
+            for (const name of ["getContents", "getPlaylist"]) {
+                const original = playlistAPI[name];
+                if (typeof original !== "function") continue;
+                originalReads.set(name, original);
+                const wrapped = async function (...args) {
+                    const state = nativeSort;
+                    if (!alive || !state || args[0] !== state.uri || routePlaylist() !== state.uri)
+                        return original.apply(this, args);
+                    const optionIndex = name === "getPlaylist" && args.length > 2 ? 2 : 1;
+                    const options = args[optionIndex];
+                    // A normal Spotify sort selection takes priority.
+                    if (options?.sort?.field && options.sort.field !== "ADDED_AT") {
+                        clearNativeSort(); return original.apply(this, args);
+                    }
+                    state.reads++;
+                    try {
+                        const result = await sortedContents(state, options);
+                        currentSort(state);
+                        if (name === "getContents") {
+                            state.served = true; nativeSortBusy = false; schedule();
+                            return pageOfSorted(result, options, result.template);
+                        }
+                        // Keep Spotify's native playlist metadata and permissions.
+                        const baseArgs = [...args];
+                        baseArgs[optionIndex] = { ...options, sort:undefined };
+                        const playlist = await original.apply(this, baseArgs);
+                        currentSort(state);
+                        if (!playlist?.contents || !Array.isArray(playlist.contents.items))
+                            throw new Error("Unsupported Spotify playlist metadata response.");
+                        state.served = true; nativeSortBusy = false; schedule();
+                        return { ...playlist, contents:pageOfSorted(result, options, playlist.contents) };
+                    } catch (error) {
+                        if (nativeSort === state) {
+                            clearNativeSort(); notify("Inline sort could not be applied: " + error.message);
+                        }
+                        // Return the actual native result on failure, never a
+                        // partially sorted page or a fabricated list of tracks.
+                        return original.apply(this, args);
+                    }
+                };
+                try { playlistAPI[name] = wrapped; }
+                catch { /* A read-only API is reported when the header is clicked. */ }
+                if (playlistAPI[name] === wrapped) wrappers.set(name, wrapped);
+            }
+            disposers.push(() => {
+                clearNativeSort();
+                for (const [name, wrapper] of wrappers) if (playlistAPI[name] === wrapper) playlistAPI[name] = originalReads.get(name);
+            });
+            return wrappers.has("getContents");
+        }
+        const nativeSortAvailable = installNativeSort();
+        async function sortInPlaylist(header) {
+            if (nativeSortBusy) return;
+            const uri = routePlaylist();
+            if (!uri) { notify("Inline sorting currently supports playlist pages."); return; }
+            if (!nativeSortAvailable) { notify("This Spotify version does not expose the native playlist sorting API."); return; }
+            const date = rows.get(header)?.date;
+            const trigger = date?.matches("button") ? date : date?.querySelector("button") || date;
+            if (!trigger || typeof trigger.click !== "function") { notify("Could not find Spotify's Date added sort control."); return; }
+            const direction = nativeSort?.uri !== uri ? "newest" : nativeSort.direction === "newest" ? "oldest" : null;
+            if (!direction) clearNativeSort();
+            else {
+                nativeSort = { uri, direction, serial:++nativeSortSerial, timestamps:new Map(cache), reads:0, served:false, promise:null };
+                nativeSortBusy = true;
+            }
+            const state = nativeSort;
+            // Ask Spotify to refresh its real sort query, using the native
+            // Date added header as the refresh control. Its API response is
+            // replaced above before Spotify renders any pages of rows.
+            trigger.click();
+            if (state) { date.setAttribute("data-lp-proxy-sort", ""); proxyHeaders.add(date); }
+            schedule();
+            if (!state) return;
+            const began = Date.now();
+            while (nativeSort === state && !state.served && Date.now() - began < 15000) await sleep(200);
+            if (nativeSort !== state) return;
+            if (!state.served) {
+                clearNativeSort();
+                notify("Spotify did not refresh the native playlist data. Inline sorting needs a compatibility adjustment for this client.");
+                return;
+            }
+            const headerCell = rows.get(header)?.cell;
+            headerCell?.setAttribute("aria-sort", direction === "newest" ? "descending" : "ascending");
+            // Keep native menus and click actions attached to the native rows.
+            // The timestamps are a snapshot until the next header click, so
+            // listening to a song does not make it jump under the mouse.
+        }
+        const onNativeHeaderClick = event => {
+            if (!event.isTrusted || !nativeSort || !(event.target instanceof Element)) return;
+            if (event.target.closest('[role="columnheader"]') && !event.target.closest(".lp-column")) clearNativeSort();
+        };
+        document.addEventListener("click", onNativeHeaderClick, true);
+        disposers.push(() => document.removeEventListener("click", onNativeHeaderClick, true));
         function settings() {
             const root = document.createElement("div"); root.className = "lp-settings";
             const intro = document.createElement("p");
@@ -604,14 +719,12 @@
           [data-lp-grid] { display:grid!important;grid-template-columns:var(--lp-columns)!important;column-gap:16px!important;padding-inline:16px!important;box-sizing:border-box!important; }
           .lp-column { display:flex!important;align-items:center;justify-content:center!important;min-width:0;white-space:nowrap;color:var(--text-subdued,#b3b3b3);font-size:13px; }
           .lp-column[role="columnheader"] { font-size:14px; }
+          [data-lp-proxy-sort] svg { visibility:hidden; }
+          [data-lp-proxy-sort] { color:var(--text-subdued,#b3b3b3)!important; }
           .lp-sort-header { background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:8px 0; }
           .lp-sort-header:hover { color:var(--text-base,#fff); }
           .lp-threshold { display:block;margin:16px 0; }
           .lp-threshold input { display:block;width:100%;margin-top:12px; }
-          .lp-sorted-list { max-height:55vh;overflow:auto;margin:16px 0; }
-          .lp-sorted-row { display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) 140px;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #4445; }
-          .lp-sorted-row span { overflow:hidden;text-overflow:ellipsis; }
-          .lp-sorted-row button { border:0!important;text-align:left;border-radius:4px!important; }
           .lp-settings p { margin:0 0 16px;line-height:1.5; }
           .lp-settings h3 { margin:24px 0 12px; }
           .lp-settings input[type=file] { display:block;margin:16px 0;max-width:100%; }
@@ -623,7 +736,7 @@
         const menu = new S.Menu.Item("Last Played", false, settings); menu.register();
         const onChange = () => { tick(); schedule(); };
         S.Player.addEventListener("songchange", onChange); S.Player.addEventListener("onplaypause", onChange);
-        const unlisten = S.Platform.History.listen(() => { observeMain(); schedule(); });
+        const unlisten = S.Platform.History.listen(() => { if (nativeSort && routePlaylist() !== nativeSort.uri) clearNativeSort(); observeMain(); schedule(); });
         window.addEventListener("resize", schedule);
         const onHide = () => { tick(); const last = tracker.finish(); if (last) record(last); void flush(); };
         window.addEventListener("pagehide", onHide);
